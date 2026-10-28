@@ -216,6 +216,23 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
         return boringssl_cmake;
     }
 
+    // `__FILE__` expansions and debug info record source paths, so without this map every object
+    // and archive names the absolute OUT_DIR. CMake runs the compilers in the canonical spelling of
+    // the build tree, which differs from OUT_DIR when the target directory is a symlink, so both
+    // spellings are mapped. MSVC has no such flag.
+    let file_prefix_map = (config.target_env != "msvc").then(|| {
+        let mut maps = vec![format!("-ffile-prefix-map={}=.", config.out_dir.display())];
+        if let Ok(canonical) = config.out_dir.canonicalize() {
+            if canonical != config.out_dir {
+                maps.push(format!("-ffile-prefix-map={}=.", canonical.display()));
+            }
+        }
+        maps.join(" ")
+    });
+    if let Some(map) = &file_prefix_map {
+        boringssl_cmake.cflag(map).cxxflag(map).asmflag(map);
+    }
+
     if config.target_os == "windows" {
         // Explicitly use the non-debug CRT.
         // This is required now because newest BoringSSL requires CMake 3.22 which
@@ -307,7 +324,13 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             };
 
             let cflag = format!("{bitcode_cflag} {target_cflag}");
-            boringssl_cmake.define("CMAKE_ASM_FLAGS", &cflag);
+            // `define` replaces the ASM flags cmake-rs would build, which drops the `asmflag` above,
+            // so the prefix map is carried in this value.
+            let asm_flags = match &file_prefix_map {
+                Some(map) => format!("{cflag} {map}"),
+                None => cflag.clone(),
+            };
+            boringssl_cmake.define("CMAKE_ASM_FLAGS", &asm_flags);
             boringssl_cmake.cflag(&cflag);
         }
 
@@ -624,12 +647,7 @@ fn install_artifacts(
     let lib_dir = install_dir.join("lib");
     fs::create_dir(&lib_dir)?;
 
-    for lib in ["libcrypto.a", "libssl.a", "bcm.o"] {
-        if !config.features.fips && lib == "bcm.o" {
-            continue;
-        }
-        fs::copy(bssl_build_dir.join(lib), lib_dir.join(lib))?;
-    }
+    copy_archives(config, bssl_build_dir, &lib_dir)?;
 
     fs_extra::dir::copy(get_include_path(config)?, &install_dir, &Default::default())?;
 
@@ -638,6 +656,42 @@ fn install_artifacts(
         install_dir.display()
     );
     Ok(())
+}
+
+/// Copies the static archives, and `bcm.o` under FIPS, from the CMake build tree into `lib_dir`.
+fn copy_archives(config: &Config, build_dir: &Path, lib_dir: &Path) -> io::Result<()> {
+    for lib in ["libcrypto.a", "libssl.a", "bcm.o"] {
+        if !config.features.fips && lib == "bcm.o" {
+            continue;
+        }
+        fs::copy(build_dir.join(lib), lib_dir.join(lib))?;
+    }
+    Ok(())
+}
+
+/// Copies the archives into `OUT_DIR/lib`, the one directory the link directives search.
+/// Runs after `prefix_symbols`, so the copies carry the prefixed symbols.
+fn stage_archives(config: &Config) -> io::Result<()> {
+    let lib_dir = config.out_dir.join("lib");
+    fs::create_dir_all(&lib_dir)?;
+    copy_archives(config, build_boringssl_or_get_prebuilt(config), &lib_dir)
+}
+
+/// Removes the BoringSSL source copy and CMake build tree, which hold absolute `OUT_DIR` paths.
+/// Call only after the archives are staged and the bindings and installs are done.
+fn remove_build_trees(config: &Config) -> io::Result<()> {
+    fs::remove_dir_all(config.out_dir.join("boringssl"))?;
+    fs::remove_dir_all(config.out_dir.join("build"))
+}
+
+/// Whether this build links the archives that `stage_archives` copies into `OUT_DIR/lib`.
+/// Prebuilt, Bazel, docs.rs and MSVC builds keep their own search paths: MSVC puts its
+/// libraries in a generator subdirectory of the build tree.
+fn stages_archives(config: &Config) -> bool {
+    config.env.path.is_none()
+        && !config.is_bazel
+        && !config.env.docs_rs
+        && config.target_env != "msvc"
 }
 
 fn main() -> ExitCode {
@@ -682,27 +736,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         install_artifacts(&config, install_dir)
             .map_err(|e| format!("install artifacts failed: {e}"))?;
     }
+    if stages_archives(&config) {
+        // Only delete the source copy and build tree when `get_boringssl_source_path` made them.
+        stage_archives(&config).map_err(|e| format!("could not stage BoringSSL archives: {e}"))?;
+        if config.env.source_path.is_none() {
+            remove_build_trees(&config)
+                .map_err(|e| format!("could not remove the BoringSSL build tree: {e}"))?;
+        }
+    }
     Ok(())
 }
 
 fn emit_link_directives(config: &Config) {
+    // Builds BoringSSL on first use. `prefix_symbols` and `stage_archives` run after this call.
     let bssl_dir = build_boringssl_or_get_prebuilt(config);
-    let msvc_lib_subdir = msvc_lib_subdir(config);
 
-    let subdirs =
-        if config.is_bazel || (config.features.is_fips_like() && config.env.path.is_some()) {
-            &["lib"][..]
-        } else {
-            &["lib", "crypto", "ssl", ""][..]
-        };
+    if stages_archives(config) {
+        // The archives sit in `OUT_DIR/lib`, so no link path names the CMake build tree.
+        println!(
+            "cargo:rustc-link-search=native={}",
+            config.out_dir.join("lib").display()
+        );
+    } else {
+        let msvc_lib_subdir = msvc_lib_subdir(config);
 
-    for subdir in subdirs {
-        let dir = bssl_dir.join(subdir);
-        let dir = msvc_lib_subdir
-            .map(|s| dir.join(s))
-            .filter(|d| d.exists())
-            .unwrap_or(dir);
-        println!("cargo:rustc-link-search=native={}", dir.display());
+        let subdirs =
+            if config.is_bazel || (config.features.is_fips_like() && config.env.path.is_some()) {
+                &["lib"][..]
+            } else {
+                &["lib", "crypto", "ssl", ""][..]
+            };
+
+        for subdir in subdirs {
+            let dir = bssl_dir.join(subdir);
+            let dir = msvc_lib_subdir
+                .map(|s| dir.join(s))
+                .filter(|d| d.exists())
+                .unwrap_or(dir);
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
     }
 
     if let Some(cpp_lib) = get_cpp_runtime_lib(config) {
