@@ -785,6 +785,18 @@ fn stage_archives(config: &Config) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes the BoringSSL source copy and CMake build tree from `OUT_DIR`. Both record absolute
+/// paths, and nothing reads them once the archives are staged and the bindings are generated.
+fn remove_build_trees(config: &Config) -> io::Result<()> {
+    for dir in ["boringssl", "build"] {
+        match fs::remove_dir_all(config.out_dir.join(dir)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     if let Err(e) = run() {
         eprintln!("boring-sys failed: {e}");
@@ -844,6 +856,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(install_dir) = &config.env.export_to_install_dir {
         install_artifacts(&config, install_dir)
             .map_err(|e| format!("install artifacts failed: {e}"))?;
+    }
+    // A caller-provided source tree keeps its build tree, so that rebuilding it stays incremental.
+    if stages_archives(&config) && config.env.source_path.is_none() {
+        remove_build_trees(&config)
+            .map_err(|e| format!("could not remove the BoringSSL build tree: {e}"))?;
     }
     Ok(())
 }
