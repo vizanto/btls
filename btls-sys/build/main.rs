@@ -729,6 +729,28 @@ fn install_artifacts(
     Ok(())
 }
 
+/// Whether the archives are copied into `OUT_DIR/lib` and linked from there. A precompiled
+/// library, a Bazel layout, docs.rs and MSVC (which puts its libraries in a generator
+/// subdirectory of the build tree) keep their own search paths.
+fn stages_archives(config: &Config) -> bool {
+    config.env.path.is_none()
+        && !config.is_bazel
+        && !config.env.docs_rs
+        && config.target_env != "msvc"
+}
+
+/// Copies `libcrypto.a` and `libssl.a` out of the CMake build tree into `OUT_DIR/lib`.
+fn stage_archives(config: &Config) -> io::Result<()> {
+    let build_dir = build_boringssl_or_get_prebuilt(config);
+    let lib_dir = config.out_dir.join("lib");
+    fs::create_dir_all(&lib_dir)?;
+    for library in ["crypto", "ssl"] {
+        let archive = find_archive(build_dir, &config.target_env, None, library)?;
+        fs::copy(archive, lib_dir.join(format!("lib{library}.a")))?;
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     if let Err(e) = run() {
         eprintln!("boring-sys failed: {e}");
@@ -762,6 +784,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if !config.env.docs_rs {
+        if stages_archives(&config) {
+            stage_archives(&config)
+                .map_err(|e| format!("could not stage the BoringSSL archives: {e}"))?;
+        }
         emit_link_directives(&config);
         if config.features.prefix_symbols && config.env.path.is_none() {
             let bssl_dir = build_boringssl_or_get_prebuilt(&config);
@@ -796,12 +822,15 @@ fn emit_link_directives(config: &Config) {
     let bssl_dir = build_boringssl_or_get_prebuilt(config);
     let msvc_lib_subdir = msvc_lib_subdir(config);
 
-    let subdirs =
-        if config.is_bazel || (config.features.is_fips_like() && config.env.path.is_some()) {
-            &["lib"][..]
-        } else {
-            &["lib", "crypto", "ssl", ""][..]
-        };
+    let (bssl_dir, subdirs) = if stages_archives(config) {
+        // The CMake build tree holds `CMakeCache.txt` and `CMakeFiles/`, which record the output
+        // path, so only the staged archives are searched.
+        (config.out_dir.as_path(), &["lib"][..])
+    } else if config.is_bazel || (config.features.is_fips_like() && config.env.path.is_some()) {
+        (bssl_dir, &["lib"][..])
+    } else {
+        (bssl_dir, &["lib", "crypto", "ssl", ""][..])
+    };
 
     for subdir in subdirs {
         let dir = bssl_dir.join(subdir);
